@@ -1,0 +1,10 @@
+Phionics is an experimental "geo-relational coherence membrane" for multi-agent AI proposal generation and fusion.
+
+Generate diverse candidates → measure informational curvature κ → adaptively weight via n-Nacci recurrence & minority-signal preservation → aggregate a coherent, ethically-aware output.
+
+This repo is a minimal, runnable open-source starter with:
+- Pure NumPy reference implementation (deterministic, no LLM calls)
+- LangChain integration for plugging in real LLMs/embedders
+- Toy demos & ethical profiles
+
+Run a quick example: `python examples/01_minimal.py`
