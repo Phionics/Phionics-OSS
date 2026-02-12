@@ -1,0 +1,533 @@
+# Copyright 2026 Phionics
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+LangChain-compatible implementation of the Phionic Geo-Relational Coherence Membrane.
+
+This wraps the membrane loop around LangChain "Runnables" so you can plug in any LLM
+(OpenAI, Anthropic, local, etc.) and any embedder/vectorstore (Chroma, FAISS, etc.).
+
+Key ideas:
+- Each Beta node is a Runnable that produces a proposal (text + optional vector embedding).
+- Each Alpha node fuses its betas (Phi fusion in vector space) and produces an Alpha proposal.
+- The Membrane computes curvature kappa across alpha vectors, selects gear, updates weights with n-Nacci,
+  applies Minority-signal hysteresis boost/caps, then aggregates a final vector + selects a final text.
+
+What you must plug in:
+- `llm_runnable`: a Runnable that takes {"prompt": str} (or {"messages": ...}) and returns a string.
+- `embedder`: any LangChain Embeddings object (must implement embed_query / embed_documents).
+- Optionally: a Chroma vectorstore retriever for policy / memory / grounding.
+
+Dependencies (typical):
+    pip install numpy chromadb langchain langchain-core langchain-community
+"""
+
+__version__ = "0.1.0"
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import math
+import numpy as np
+
+from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_core.documents import Document
+from langchain_community.vectorstores import Chroma
+from langchain_core.embeddings import Embeddings
+
+
+# -----------------------------------------------------------------------------
+# Numeric core (matches the standalone phionics_membrane.py reference)
+# -----------------------------------------------------------------------------
+
+EPSILON: float = 1e-8
+PI: float = math.pi
+PHI: float = (1.0 + math.sqrt(5.0)) / 2.0
+CR_REF: float = 1.0
+
+W1, W2, W3, W4 = 0.25, 0.25, 0.25, 0.25
+TAU1, TAU2, TAU3 = 0.25, 0.50, 0.75
+
+COHERENCE_MIN = 0.8
+WEIGHT_MAX_FOR_MINOR = 0.05
+MINORITY_WINDOW = 3
+BOOST_FACTOR = 2.0
+MAX_WEIGHT_FRACTION = 0.15
+
+Vector = np.ndarray
+
+
+def vnorm(v: Vector) -> float:
+    return float(np.linalg.norm(v))
+
+
+def safe_cos_angle(u: Vector, v: Vector) -> float:
+    nu = vnorm(u)
+    nv = vnorm(v)
+    denom = max(nu * nv, EPSILON)
+    c = float(np.dot(u, v) / denom)
+    return max(-1.0, min(1.0, c))
+
+
+@dataclass
+class CurvatureComputer:
+    cr_ref: float = CR_REF
+    weights: Tuple[float, float, float, float] = (W1, W2, W3, W4)
+
+    def compute(self, proposals: Sequence[Vector]) -> float:
+        N = len(proposals)
+        if N == 0:
+            return 0.0
+
+        m = np.mean(np.stack(proposals, axis=0), axis=0)
+        denom = max(vnorm(m), EPSILON)
+
+        dists = [vnorm(v - m) for v in proposals]
+        R_res = (sum(dists) / N) / denom
+
+        angs: List[float] = []
+        for v in proposals:
+            if vnorm(v) < EPSILON:
+                continue
+            theta = math.acos(safe_cos_angle(v, m))
+            angs.append(theta / PI)
+        R_ang = sum(angs) / max(len(angs), 1)
+
+        mags = sorted(vnorm(v) for v in proposals)
+        if N < 2:
+            R_amp = 0.0
+        else:
+            devs: List[float] = []
+            for j in range(N - 1):
+                r = mags[j + 1] / max(mags[j], EPSILON)
+                devs.append(abs(r - PHI) / PHI)
+            R_amp = sum(devs) / max(len(devs), 1)
+
+        if N < 4:
+            R_cr = 0.0
+        else:
+            cr_devs: List[float] = []
+            for start in range(0, N - 3):
+                a, b, c, d = mags[start:start + 4]
+                num = (a - c) * (b - d)
+                den = (a - d) * (b - c)
+                if abs(den) < EPSILON:
+                    continue
+                cr = num / den
+                cr_devs.append(abs(cr - self.cr_ref) / max(abs(self.cr_ref), EPSILON))
+            R_cr = sum(cr_devs) / max(len(cr_devs), 1)
+
+        w1, w2, w3, w4 = self.weights
+        return float(w1 * R_res + w2 * R_ang + w3 * R_amp + w4 * R_cr)
+
+
+class GearMode(Enum):
+    FIBONACCI_2 = 2
+    TRIBONACCI_3 = 3
+    TETRANACCI_4 = 4
+    DODECANACCI_12 = 12
+
+
+@dataclass
+class GearController:
+    tau1: float = TAU1
+    tau2: float = TAU2
+    tau3: float = TAU3
+
+    def select(self, kappa: float) -> GearMode:
+        if kappa <= self.tau1:
+            return GearMode.FIBONACCI_2
+        if kappa <= self.tau2:
+            return GearMode.TRIBONACCI_3
+        if kappa <= self.tau3:
+            return GearMode.TETRANACCI_4
+        return GearMode.DODECANACCI_12
+
+
+@dataclass
+class NnacciWeightUpdater:
+    def update(
+        self,
+        current_weights: Sequence[float],
+        weights_history: Sequence[List[float]],
+        mode: GearMode,
+    ) -> List[float]:
+        n = int(mode.value)
+        alpha = 1.0 / n
+        out: List[float] = []
+        for i, w in enumerate(current_weights):
+            hist = weights_history[i]
+            if not hist:
+                out.append(float(w))
+                continue
+            sum_prev, count = 0.0, 0
+            for k in range(1, n + 1):
+                idx = len(hist) - k
+                if idx < 0:
+                    break
+                sum_prev += hist[idx]
+                count += 1
+            out.append(float(w) if count == 0 else alpha * sum_prev)
+        return out
+
+
+@dataclass
+class MinoritySignalModule:
+    coherence_min: float = COHERENCE_MIN
+    weight_max_for_minor: float = WEIGHT_MAX_FOR_MINOR
+    minority_window: int = MINORITY_WINDOW
+    boost_factor: float = BOOST_FACTOR
+    max_weight_fraction: float = MAX_WEIGHT_FRACTION
+
+    def apply(
+        self,
+        weights: Sequence[float],
+        coherence_scores: Sequence[float],
+        minority_counter: Sequence[int],
+    ) -> Tuple[List[float], List[int]]:
+        boosted = list(map(float, weights))
+        counters = list(minority_counter)
+
+        total_weight = max(sum(boosted), EPSILON)
+
+        for i in range(len(boosted)):
+            frac = boosted[i] / total_weight
+            if (coherence_scores[i] >= self.coherence_min) and (frac <= self.weight_max_for_minor):
+                counters[i] += 1
+            else:
+                counters[i] = 0
+
+            if counters[i] >= self.minority_window:
+                boosted[i] *= self.boost_factor
+
+        total_boosted = max(sum(boosted), EPSILON)
+        for i in range(len(boosted)):
+            frac = boosted[i] / total_boosted
+            if frac > self.max_weight_fraction:
+                boosted[i] = self.max_weight_fraction * total_boosted
+
+        s = max(sum(boosted), EPSILON)
+        boosted = [w / s for w in boosted]
+        return boosted, counters
+
+
+# -----------------------------------------------------------------------------
+# LangChain proposal objects
+# -----------------------------------------------------------------------------
+
+@dataclass
+class Proposal:
+    text: str
+    vector: Vector
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EthicalProfile:
+    name: str
+    coefficients: Dict[str, float] = field(default_factory=dict)
+
+    def weight(self, key: str, default: float = 1.0) -> float:
+        return float(self.coefficients.get(key, default))
+
+
+# -----------------------------------------------------------------------------
+# Coherence scoring
+# -----------------------------------------------------------------------------
+
+def cosine_sim(u: Vector, v: Vector) -> float:
+    return float(np.dot(u, v) / max(vnorm(u) * vnorm(v), EPSILON))
+
+
+@dataclass
+class CoherenceScorer:
+    embedder: Embeddings
+    retriever: Optional[Any] = None
+    profile: Optional[EthicalProfile] = None
+
+    def score(self, proposal: Proposal, query: str) -> float:
+        qv = np.array(self.embedder.embed_query(query), dtype=np.float64)
+        sim = (cosine_sim(proposal.vector, qv) + 1.0) / 2.0  # [-1,1] -> [0,1]
+
+        if self.retriever is not None:
+            docs: List[Document] = self.retriever.get_relevant_documents(query)
+            if docs:
+                dv = np.array(self.embedder.embed_documents([d.page_content for d in docs])[0], dtype=np.float64)
+                gsim = (cosine_sim(proposal.vector, dv) + 1.0) / 2.0
+                sim = 0.7 * sim + 0.3 * gsim
+
+        profile = self.profile
+        if profile is not None:
+            harm_penalty = profile.weight("harm_penalty", 0.0)
+            amp = vnorm(proposal.vector)
+            sim *= (1.0 - min(0.9, harm_penalty * (amp / (amp + 1.0))))
+
+        return float(max(0.0, min(1.0, sim)))
+
+
+def _safe_embed(embedder: Embeddings, text: str) -> Vector:
+    return np.array(embedder.embed_query(text), dtype=np.float64)
+
+
+# -----------------------------------------------------------------------------
+# Beta and Alpha nodes as Runnables
+# -----------------------------------------------------------------------------
+
+@dataclass
+class BetaLLMNode:
+    name: str
+    llm_runnable: Runnable
+    embedder: Embeddings
+    prompt_builder: Callable[[str, str], str]
+
+    def runnable(self) -> Runnable:
+        def _run(inputs: Dict[str, Any]) -> Proposal:
+            query: str = inputs["query"]
+            prompt = self.prompt_builder(query, self.name)
+            out = self.llm_runnable.invoke({"prompt": prompt})
+            text = out if isinstance(out, str) else getattr(out, "content", str(out))
+            v = _safe_embed(self.embedder, text)
+            return Proposal(text=text, vector=v, meta={"beta": self.name})
+
+        return RunnableLambda(_run)
+
+
+@dataclass
+class AlphaNode:
+    name: str
+    betas: List[BetaLLMNode]
+    embedder: Embeddings
+    ethical_profile: EthicalProfile
+    alpha_summarizer: Optional[Runnable] = None
+
+    def fuse_betas_phi(self, beta_vectors: Sequence[Vector]) -> Vector:
+        fused = beta_vectors[0]
+        for nxt in beta_vectors[1:]:
+            fused = 0.5 * (fused + nxt) + (PHI / 2.0) * (fused - nxt)
+        return fused
+
+    def runnable(self) -> Runnable:
+        beta_runs = [b.runnable() for b in self.betas]
+
+        def _run(inputs: Dict[str, Any]) -> Proposal:
+            query: str = inputs["query"]
+            beta_props = [br.invoke({"query": query}) for br in beta_runs]
+            fused_vec = self.fuse_betas_phi([p.vector for p in beta_props])
+
+            if self.alpha_summarizer is not None:
+                joined = "\n\n".join([f"[{p.meta.get('beta')}]\n{p.text}" for p in beta_props])
+                prompt = (
+                    f"You are {self.name}. Synthesize the beta proposals into ONE response.\n\n"
+                    f"User query:\n{query}\n\nBeta proposals:\n{joined}\n\n"
+                    f"Return one coherent answer."
+                )
+                out = self.alpha_summarizer.invoke({"prompt": prompt})
+                text = out if isinstance(out, str) else getattr(out, "content", str(out))
+            else:
+                sims = [cosine_sim(p.vector, fused_vec) for p in beta_props]
+                text = beta_props[int(np.argmax(sims))].text
+
+            aligned_vec = _safe_embed(self.embedder, text)
+
+            return Proposal(
+                text=text,
+                vector=aligned_vec,
+                meta={
+                    "alpha": self.name,
+                    "ethical_profile": self.ethical_profile.name,
+                    "betas": [p.meta.get("beta") for p in beta_props],
+                },
+            )
+
+        return RunnableLambda(_run)
+
+
+# -----------------------------------------------------------------------------
+# Topology + membrane orchestration
+# -----------------------------------------------------------------------------
+
+@dataclass
+class GeodesicTopology:
+    neighbors: Dict[int, List[int]]
+
+    @staticmethod
+    def ring(n: int) -> "GeodesicTopology":
+        return GeodesicTopology({i: [((i - 1) % n), ((i + 1) % n)] for i in range(n)})
+
+
+@dataclass
+class PhionicLangChainMembrane:
+    alphas: List[AlphaNode]
+    embedder: Embeddings
+    topology: GeodesicTopology
+
+    curvature: CurvatureComputer = field(default_factory=CurvatureComputer)
+    gear: GearController = field(default_factory=GearController)
+    updater: NnacciWeightUpdater = field(default_factory=NnacciWeightUpdater)
+    minority: MinoritySignalModule = field(default_factory=MinoritySignalModule)
+
+    retriever: Optional[Any] = None
+
+    weights: List[float] = field(init=False)
+    weights_history: List[List[float]] = field(init=False)
+    minority_counter: List[int] = field(init=False)
+    scorers: List[CoherenceScorer] = field(init=False)
+
+    def __post_init__(self) -> None:
+        n = len(self.alphas)
+        self.weights = [1.0 / n] * n
+        self.weights_history = [[] for _ in range(n)]
+        self.minority_counter = [0 for _ in range(n)]
+        self.scorers = [
+            CoherenceScorer(embedder=self.embedder, retriever=self.retriever, profile=a.ethical_profile)
+            for a in self.alphas
+        ]
+
+    def _neighbor_refine(
+        self, vectors: List[Vector], weights: Sequence[float], steps: int = 1, neighbor_mix: float = 0.25
+    ) -> List[Vector]:
+        v = [x.copy() for x in vectors]
+        n = len(v)
+        for _ in range(steps):
+            new_v: List[Vector] = []
+            for i in range(n):
+                neigh = self.topology.neighbors.get(i, [])
+                if not neigh:
+                    new_v.append(v[i])
+                    continue
+                w_neigh = np.array([weights[j] for j in neigh], dtype=np.float64)
+                w_neigh = w_neigh / max(float(w_neigh.sum()), EPSILON)
+                neigh_mean = sum((v[j] * w_neigh[k]) for k, j in enumerate(neigh))
+                new_v.append((1.0 - neighbor_mix) * v[i] + neighbor_mix * neigh_mean)
+            v = new_v
+        return v
+
+    def _final_text(self, alpha_props: List[Proposal], weights: Sequence[float]) -> str:
+        w = np.asarray(weights, dtype=np.float64)
+        w = w / max(float(w.sum()), EPSILON)
+        centroid = sum(alpha_props[i].vector * w[i] for i in range(len(alpha_props)))
+        sims = [cosine_sim(p.vector, centroid) for p in alpha_props]
+        return alpha_props[int(np.argmax(sims))].text
+
+    def step(self, query: str, neighbor_refinement_steps: int = 1) -> Dict[str, Any]:
+        alpha_props = [a.runnable().invoke({"query": query}) for a in self.alphas]
+
+        refined_vecs = self._neighbor_refine([p.vector for p in alpha_props], self.weights, steps=neighbor_refinement_steps)
+        for i, p in enumerate(alpha_props):
+            p.vector = refined_vecs[i]
+
+        coherence_scores = [self.scorers[i].score(alpha_props[i], query) for i in range(len(alpha_props))]
+
+        kappa = self.curvature.compute([p.vector for p in alpha_props])
+        mode = self.gear.select(kappa)
+
+        base_weights = self.updater.update(self.weights, self.weights_history, mode)
+        new_weights, self.minority_counter = self.minority.apply(base_weights, coherence_scores, self.minority_counter)
+
+        for i in range(len(self.alphas)):
+            self.weights_history[i].append(self.weights[i])
+            if len(self.weights_history[i]) > 64:
+                self.weights_history[i] = self.weights_history[i][-64:]
+
+        self.weights = new_weights
+
+        agg_vec = sum(alpha_props[i].vector * self.weights[i] for i in range(len(alpha_props)))
+        final_text = self._final_text(alpha_props, self.weights)
+
+        return {
+            "kappa": kappa,
+            "gear_mode": mode.name,
+            "weights": list(self.weights),
+            "coherence_scores": coherence_scores,
+            "alpha_proposals": alpha_props,
+            "aggregated_vector": agg_vec,
+            "final_text": final_text,
+        }
+
+    def runnable(self) -> Runnable:
+        return RunnableLambda(lambda inputs: self.step(inputs["query"]))
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def default_beta_prompt(query: str, beta_name: str) -> str:
+    return (
+        f"You are Beta agent {beta_name}. Produce a candidate answer.\n\n"
+        f"User query:\n{query}\n\n"
+        f"Constraints:\n- Be concrete.\n- If uncertain, say so briefly.\n"
+    )
+
+
+def build_chroma_retriever(persist_dir: str, collection: str, embedder: Embeddings, k: int = 4) -> Any:
+    vs = Chroma(collection_name=collection, persist_directory=persist_dir, embedding_function=embedder)
+    return vs.as_retriever(search_kwargs={"k": k})
+
+
+def build_demo_membrane(llm_runnable: Runnable, embedder: Embeddings, retriever: Optional[Any] = None) -> PhionicLangChainMembrane:
+    profiles = [
+        EthicalProfile("Logic", {"harm_penalty": 0.05}),
+        EthicalProfile("Ethics", {"harm_penalty": 0.20}),
+        EthicalProfile("Integration", {"harm_penalty": 0.10}),
+        EthicalProfile("Emotion", {"harm_penalty": 0.08}),
+        EthicalProfile("AdversarialRigor", {"harm_penalty": 0.12}),
+    ]
+
+    def mk_alpha(name: str, profile: EthicalProfile) -> AlphaNode:
+        betas = [
+            BetaLLMNode(name=f"{name}.b1", llm_runnable=llm_runnable, embedder=embedder, prompt_builder=default_beta_prompt),
+            BetaLLMNode(name=f"{name}.b2", llm_runnable=llm_runnable, embedder=embedder, prompt_builder=default_beta_prompt),
+        ]
+        return AlphaNode(name=name, betas=betas, embedder=embedder, ethical_profile=profile, alpha_summarizer=llm_runnable)
+
+    alphas = [mk_alpha(n, profiles[i]) for i, n in enumerate(["alphaA", "alphaB", "alphaC", "alphaD", "alphaE"])]
+    topo = GeodesicTopology.ring(len(alphas))
+    return PhionicLangChainMembrane(alphas=alphas, embedder=embedder, topology=topo, retriever=retriever)
+
+
+# -----------------------------------------------------------------------------
+# Demo (runnable without external LLM/embedder for testing)
+# -----------------------------------------------------------------------------
+
+def demo() -> None:
+    class DummyLLM(Runnable):
+        def invoke(self, inputs: Dict[str, Any]) -> str:
+            return "Dummy response for prompt: " + inputs.get("prompt", "")
+
+    class DummyEmbedder(Embeddings):
+        def embed_query(self, text: str) -> List[float]:
+            return [hash(text) % 100 / 100.0] * 64  # Toy 64-dim vector
+
+        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            return [self.embed_query(t) for t in texts]
+
+    llm = DummyLLM()
+    embedder = DummyEmbedder()
+
+    membrane = build_demo_membrane(llm, embedder)
+    query = "Test query for coherence."
+    out = membrane.step(query)
+
+    print("Final text:", out["final_text"])
+    print("Kappa:", round(out["kappa"], 4))
+    print("Gear:", out["gear_mode"])
+    print("Weights:", [round(w, 4) for w in out["weights"]])
+
+
+if __name__ == "__main__":
+    demo()
