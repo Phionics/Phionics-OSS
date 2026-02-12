@@ -1,0 +1,548 @@
+# Copyright 2026 Phionics
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+A reference implementation of the "Phionic Geo-Relational Coherence Membrane" described in:
+- 1535-02P_Spec_r2.docx (spec)
+- 1535-02P_Appendix A.pdf (Appendix A pseudocode)
+- 1535-02P_Drawings.pdf (figures)
+
+This module is intentionally:
+- deterministic (seeded RNG),
+- self-contained (no external LLM calls),
+- extensible (plug-in proposal generators / scorers / ethical profiles).
+
+Dependencies:
+    pip install numpy
+
+Usage:
+    python -m phionics_membrane  # runs a small demo
+"""
+
+__version__ = "0.1.0"
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+import math
+import numpy as np
+from numpy.typing import NDArray
+
+
+# ---------------------------------------------------------------------------
+# Constants (Appendix A defaults)
+# ---------------------------------------------------------------------------
+
+EPSILON: float = 1e-8
+PI: float = math.pi
+PHI: float = (1.0 + math.sqrt(5.0)) / 2.0  # 1.618...
+CR_REF: float = 1.0
+
+# Curvature weights (w1..w4)
+W1, W2, W3, W4 = 0.25, 0.25, 0.25, 0.25
+
+# Example curvature thresholds for gear selection
+TAU1, TAU2, TAU3 = 0.25, 0.50, 0.75
+
+# Minority-signal parameters (hysteresis)
+COHERENCE_MIN = 0.8
+WEIGHT_MAX_FOR_MINOR = 0.05
+MINORITY_WINDOW = 3
+BOOST_FACTOR = 2.0
+MAX_WEIGHT_FRACTION = 0.15
+
+
+# ---------------------------------------------------------------------------
+# Vector utilities
+# ---------------------------------------------------------------------------
+
+Vector = NDArray[np.float64]
+
+
+def vnorm(v: Vector) -> float:
+    return float(np.linalg.norm(v))
+
+
+def safe_cos_angle(u: Vector, v: Vector) -> float:
+    """Return cos(theta) between u and v, with epsilon protection."""
+    nu = vnorm(u)
+    nv = vnorm(v)
+    denom = max(nu * nv, EPSILON)
+    c = float(np.dot(u, v) / denom)
+    return max(-1.0, min(1.0, c))
+
+
+# ---------------------------------------------------------------------------
+# Curvature κ (Appendix A pseudocode)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CurvatureComputer:
+    """Compute informational curvature κ from proposal vectors.
+
+    κ = w1*R_res + w2*R_ang + w3*R_amp + w4*R_cr
+    """
+
+    cr_ref: float = CR_REF
+    weights: Tuple[float, float, float, float] = (W1, W2, W3, W4)
+
+    def compute(self, proposals: Sequence[Vector]) -> float:
+        N = len(proposals)
+        if N == 0:
+            return 0.0
+
+        # Mean vector m
+        m = np.mean(np.stack(proposals, axis=0), axis=0)
+        denom = max(vnorm(m), EPSILON)
+
+        # 1) Residual deviation R_res
+        dists = [vnorm(v - m) for v in proposals]
+        R_res = (sum(dists) / N) / denom
+
+        # 2) Angular deviation R_ang
+        angs: List[float] = []
+        for v in proposals:
+            if vnorm(v) < EPSILON:
+                continue
+            cos_t = safe_cos_angle(v, m)
+            theta = math.acos(cos_t)  # [0, PI]
+            angs.append(theta / PI)   # normalize to [0,1]
+        R_ang = np.mean(angs) if angs else 0.0
+
+        # 3) Amplitude deviation R_amp relative to PHI
+        mags = sorted(vnorm(v) for v in proposals)
+        if N < 2:
+            R_amp = 0.0
+        else:
+            devs: List[float] = []
+            for j in range(N - 1):
+                a_j = mags[j]
+                a_j1 = mags[j + 1]
+                r_j = a_j1 / max(a_j, EPSILON)
+                devs.append(abs(r_j - PHI) / PHI)
+            R_amp = np.mean(devs) if devs else 0.0
+
+        # 4) Projective cross-ratio distortion R_cr
+        if N < 4:
+            R_cr = 0.0
+        else:
+            cr_devs: List[float] = []
+            for start in range(0, N - 3):
+                a, b, c, d = mags[start:start + 4]
+                num = (a - c) * (b - d)
+                den = (a - d) * (b - c)
+                if abs(den) < EPSILON:
+                    continue
+                cr = num / den
+                cr_devs.append(abs(cr - self.cr_ref) / max(abs(self.cr_ref), EPSILON))
+            R_cr = np.mean(cr_devs) if cr_devs else 0.0
+
+        w1, w2, w3, w4 = self.weights
+        kappa = w1 * R_res + w2 * R_ang + w3 * R_amp + w4 * R_cr
+        return float(kappa)
+
+
+# ---------------------------------------------------------------------------
+# Gear selection + n-Nacci weight update (Appendix A pseudocode)
+# ---------------------------------------------------------------------------
+
+class GearMode(Enum):
+    FIBONACCI_2 = 2
+    TRIBONACCI_3 = 3
+    TETRANACCI_4 = 4
+    DODECANACCI_12 = 12
+
+
+@dataclass
+class GearController:
+    tau1: float = TAU1
+    tau2: float = TAU2
+    tau3: float = TAU3
+
+    def select(self, kappa: float) -> GearMode:
+        if kappa <= self.tau1:
+            return GearMode.FIBONACCI_2
+        if kappa <= self.tau2:
+            return GearMode.TRIBONACCI_3
+        if kappa <= self.tau3:
+            return GearMode.TETRANACCI_4
+        return GearMode.DODECANACCI_12
+
+
+@dataclass
+class NnacciWeightUpdater:
+    """Update weights using an n-Nacci recurrence.
+
+    Appendix A uses a simple equal-coefficient average over the last n weights:
+        new_w[i] = (1/n) * sum_{k=1..n} hist[i][-k]
+    """
+
+    def update(
+        self,
+        current_weights: Sequence[float],
+        weights_history: Sequence[List[float]],
+        mode: GearMode,
+    ) -> List[float]:
+        n = int(mode.value)
+        alpha = 1.0 / n
+
+        new_weights: List[float] = []
+        for i, w in enumerate(current_weights):
+            hist = weights_history[i]
+            if not hist:
+                new_weights.append(float(w))
+                continue
+            sum_prev = 0.0
+            count = 0
+            for k in range(1, n + 1):
+                idx = len(hist) - k
+                if idx < 0:
+                    break
+                sum_prev += hist[idx]
+                count += 1
+            if count == 0:
+                new_weights.append(float(w))
+            else:
+                new_weights.append(alpha * sum_prev)
+
+        return new_weights
+
+
+# ---------------------------------------------------------------------------
+# Minority signal preservation (Appendix A pseudocode)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MinoritySignalModule:
+    coherence_min: float = COHERENCE_MIN
+    weight_max_for_minor: float = WEIGHT_MAX_FOR_MINOR
+    minority_window: int = MINORITY_WINDOW
+    boost_factor: float = BOOST_FACTOR
+    max_weight_fraction: float = MAX_WEIGHT_FRACTION
+
+    def apply(
+        self,
+        weights: Sequence[float],
+        coherence_scores: Sequence[float],
+        minority_counter: Sequence[int],
+    ) -> Tuple[List[float], List[int]]:
+        N = len(weights)
+        boosted = list(map(float, weights))
+
+        total_weight = max(sum(boosted), EPSILON)
+        counters = list(minority_counter)
+
+        # hysteresis tracking + boost
+        for i in range(N):
+            frac = boosted[i] / total_weight
+            if (coherence_scores[i] >= self.coherence_min) and (frac <= self.weight_max_for_minor):
+                counters[i] += 1
+            else:
+                counters[i] = 0
+
+            if counters[i] >= self.minority_window:
+                boosted[i] *= self.boost_factor
+
+        # cap per-agent fraction
+        total_boosted = max(sum(boosted), EPSILON)
+        for i in range(N):
+            frac = boosted[i] / total_boosted
+            if frac > self.max_weight_fraction:
+                boosted[i] = self.max_weight_fraction * total_boosted
+
+        # renormalize to sum=1
+        s = max(sum(boosted), EPSILON)
+        boosted = [w / s for w in boosted]
+
+        return boosted, counters
+
+
+# ---------------------------------------------------------------------------
+# Ethics and coherence scoring hooks
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EthicalProfile:
+    """Minimal ethical profile: in practice, this would be RAG-backed text + rules."""
+    name: str
+    coefficients: Dict[str, float] = field(default_factory=dict)
+
+    def weight(self, key: str, default: float = 1.0) -> float:
+        return float(self.coefficients.get(key, default))
+
+
+CoherenceScorer = Callable[[Vector, str, EthicalProfile], float]
+# signature: scorer(proposal_vector, query_text, ethical_profile) -> [0,1]
+
+
+def default_coherence_scorer(v: Vector, query: str, profile: EthicalProfile) -> float:
+    """A deterministic, toy coherence score in [0,1]. Replace with your real scorer."""
+    amp = vnorm(v)
+    base = 1.0 - math.exp(-amp)
+
+    harm_penalty = profile.weight("harm_penalty", 0.0)
+    score = base * (1.0 - min(0.9, harm_penalty * (amp / (amp + 1.0))))
+    return float(max(0.0, min(1.0, score)))
+
+
+# ---------------------------------------------------------------------------
+# Beta agents: proposal generation
+# ---------------------------------------------------------------------------
+
+ProposalGenerator = Callable[[np.random.Generator, str, int], Vector]
+# signature: gen(rng, query_text, d) -> Vector
+
+
+def make_beta_generator(bias: str, scale: float = 1.0) -> ProposalGenerator:
+    """Factory to create beta generators with distinct behavioral biases."""
+    def gen(rng: np.random.Generator, query: str, d: int) -> Vector:
+        if bias == "explore":
+            v = rng.normal(0.0, 1.0, size=d) * scale
+        elif bias == "exploit":
+            v = rng.normal(0.0, 0.25, size=d) * scale
+        elif bias == "conservative":
+            v = rng.normal(0.0, 0.1, size=d) * scale
+        elif bias == "novelty":
+            v = rng.normal(0.0, 0.2, size=d)
+            k = max(1, d // 10)
+            idx = rng.choice(d, size=k, replace=False)
+            v[idx] += rng.normal(0.0, 2.0, size=k) * scale
+        else:
+            v = rng.normal(0.0, 0.5, size=d) * scale
+        return v.astype(np.float64)
+    return gen
+
+
+@dataclass
+class BetaAgent:
+    name: str
+    generator: ProposalGenerator
+
+    def propose(self, rng: np.random.Generator, query: str, d: int) -> Vector:
+        return self.generator(rng, query, d)
+
+
+# ---------------------------------------------------------------------------
+# Alpha agent: fuse betas + neighbor exchange
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AlphaAgent:
+    name: str
+    betas: List[BetaAgent]
+    ethical_profile: EthicalProfile
+    coherence_scorer: CoherenceScorer = default_coherence_scorer
+
+    def fuse_betas_phi(self, beta_vectors: Sequence[Vector]) -> Vector:
+        """Golden-ratio biased fusion. If >2 betas, fold pairwise."""
+        if not beta_vectors:
+            raise ValueError("No beta vectors to fuse.")
+        if len(beta_vectors) == 1:
+            return beta_vectors[0]
+
+        fused = beta_vectors[0]
+        for nxt in beta_vectors[1:]:
+            fused = 0.5 * (fused + nxt) + (PHI / 2.0) * (fused - nxt)
+        return fused
+
+    def propose(self, rng: np.random.Generator, query: str, d: int) -> Vector:
+        beta_vecs = [b.propose(rng, query, d) for b in self.betas]
+        return self.fuse_betas_phi(beta_vecs)
+
+    def coherence(self, proposal: Vector, query: str) -> float:
+        return self.coherence_scorer(proposal, query, self.ethical_profile)
+
+
+# ---------------------------------------------------------------------------
+# Geodesic network topology (pentagon/ring by default)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GeodesicTopology:
+    neighbors: Dict[int, List[int]]
+
+    @staticmethod
+    def ring(n: int) -> "GeodesicTopology":
+        neigh: Dict[int, List[int]] = {}
+        for i in range(n):
+            neigh[i] = [((i - 1) % n), ((i + 1) % n)]
+        return GeodesicTopology(neigh)
+
+
+# ---------------------------------------------------------------------------
+# Aggregation: resonance fusion across alpha proposals and weights
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AggregatedSolutionModule:
+    def aggregate(self, proposals: Sequence[Vector], weights: Sequence[float]) -> Vector:
+        if not proposals:
+            raise ValueError("No proposals to aggregate.")
+        w = np.asarray(weights, dtype=np.float64)
+        w = w / max(float(w.sum()), EPSILON)
+        stacked = np.stack(proposals, axis=0)
+        return (stacked * w[:, None]).sum(axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Phionic Coherence Membrane: closed loop controller
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PhionicCoherenceMembrane:
+    alphas: List[AlphaAgent]
+    topology: GeodesicTopology
+    d: int = 64
+
+    curvature: CurvatureComputer = field(default_factory=CurvatureComputer)
+    gear: GearController = field(default_factory=GearController)
+    updater: NnacciWeightUpdater = field(default_factory=NnacciWeightUpdater)
+    minority: MinoritySignalModule = field(default_factory=MinoritySignalModule)
+    aggregator: AggregatedSolutionModule = field(default_factory=AggregatedSolutionModule)
+
+    rng_seed: int = 12345
+
+    weights: List[float] = field(init=False)
+    weights_history: List[List[float]] = field(init=False)
+    minority_counter: List[int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        n = len(self.alphas)
+        self.weights = [1.0 / n] * n
+        self.weights_history = [[] for _ in range(n)]
+        self.minority_counter = [0 for _ in range(n)]
+
+    def _neighbor_refine(
+        self,
+        proposals: List[Vector],
+        weights: Sequence[float],
+        steps: int = 1,
+        neighbor_mix: float = 0.25,
+    ) -> List[Vector]:
+        p = [v.copy() for v in proposals]
+        n = len(p)
+        for _ in range(steps):
+            new_p = []
+            for i in range(n):
+                neigh = self.topology.neighbors.get(i, [])
+                if not neigh:
+                    new_p.append(p[i])
+                    continue
+                w_neigh = np.array([weights[j] for j in neigh], dtype=np.float64)
+                w_neigh = w_neigh / max(float(w_neigh.sum()), EPSILON)
+                neigh_mean = sum((p[j] * w_neigh[k]) for k, j in enumerate(neigh))
+                new_p.append((1.0 - neighbor_mix) * p[i] + neighbor_mix * neigh_mean)
+            p = new_p
+        return p
+
+    def step(
+        self,
+        query: str,
+        neighbor_refinement_steps: int = 1,
+        ghost_data: bool = True,
+        ghost_kappa_threshold: float = 0.9,
+        max_ghost: int = 2,
+    ) -> Dict[str, object]:
+        rng = np.random.default_rng(self.rng_seed)
+        self.rng_seed = int(rng.integers(0, 2**31 - 1))
+
+        proposals = [a.propose(rng, query, self.d) for a in self.alphas]
+
+        if ghost_data:
+            k_pre = self.curvature.compute(proposals)
+            if k_pre >= ghost_kappa_threshold:
+                m = np.mean(np.stack(proposals, axis=0), axis=0)
+                for _ in range(max_ghost):
+                    jitter = rng.normal(0.0, 0.25, size=self.d)
+                    proposals.append((m + jitter).astype(np.float64))
+
+        proposals_refined = self._neighbor_refine(proposals, self.weights, steps=neighbor_refinement_steps)
+
+        alpha_props = proposals_refined[: len(self.alphas)]
+        coherence_scores = [self.alphas[i].coherence(alpha_props[i], query) for i in range(len(self.alphas))]
+
+        kappa = self.curvature.compute(alpha_props)
+        mode = self.gear.select(kappa)
+
+        base_weights = self.updater.update(self.weights, self.weights_history, mode)
+        new_weights, self.minority_counter = self.minority.apply(
+            base_weights, coherence_scores, self.minority_counter
+        )
+
+        for i in range(len(self.alphas)):
+            self.weights_history[i].append(self.weights[i])
+            if len(self.weights_history[i]) > 64:
+                self.weights_history[i] = self.weights_history[i][-64:]
+
+        self.weights = new_weights
+        aggregated = self.aggregator.aggregate(alpha_props, self.weights)
+
+        return {
+            "kappa": kappa,
+            "gear_mode": mode.name,
+            "weights": list(self.weights),
+            "coherence_scores": coherence_scores,
+            "alpha_proposals": alpha_props,
+            "aggregated_solution": aggregated,
+        }
+
+    def run(
+        self,
+        query: str,
+        cycles: int = 10,
+        convergence: Optional[Callable[[Dict[str, object]], bool]] = None,
+        **step_kwargs,
+    ) -> Dict[str, object]:
+        last: Dict[str, object] = {}
+        for _ in range(cycles):
+            last = self.step(query, **step_kwargs)
+            if convergence and convergence(last):
+                break
+        return last
+
+
+def demo() -> None:
+    profiles = [
+        EthicalProfile("Logic", {"harm_penalty": 0.05}),
+        EthicalProfile("Ethics", {"harm_penalty": 0.20}),
+        EthicalProfile("Integration", {"harm_penalty": 0.10}),
+        EthicalProfile("Emotion", {"harm_penalty": 0.08}),
+        EthicalProfile("AdversarialRigor", {"harm_penalty": 0.12}),
+    ]
+
+    def mk_alpha(name: str, profile: EthicalProfile) -> AlphaAgent:
+        betas = [
+            BetaAgent(f"{name}.b1", make_beta_generator("explore", scale=1.0)),
+            BetaAgent(f"{name}.b2", make_beta_generator("conservative", scale=1.0)),
+        ]
+        return AlphaAgent(name=name, betas=betas, ethical_profile=profile)
+
+    alphas = [mk_alpha(n, profiles[i]) for i, n in enumerate(["αA", "αB", "αC", "αD", "αE"])]
+    topo = GeodesicTopology.ring(len(alphas))
+
+    membrane = PhionicCoherenceMembrane(alphas=alphas, topology=topo, d=64, rng_seed=42)
+
+    query = "Optimize a candidate under ethical proportionality and coherence."
+    out = membrane.run(query, cycles=8)
+
+    print("Final gear:", out["gear_mode"])
+    print("Final κ:", round(float(out["kappa"]), 4))
+    print("Weights:", [round(w, 4) for w in out["weights"]])
+    print("Coherence:", [round(c, 4) for c in out["coherence_scores"]])
+
+
+if __name__ == "__main__":
+    demo()
